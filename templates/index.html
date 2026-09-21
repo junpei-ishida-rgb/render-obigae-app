@@ -1,0 +1,237 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>帯替えツール | AMUSE不動産</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-inner">
+    <span class="logo-dot"></span>
+    <h1>帯替えツール</h1>
+    <span class="subtitle">他社図面 → AMUSE不動産の帯に自動差し替え</span>
+  </div>
+</header>
+
+<main class="container">
+
+  <section class="panel upload-panel">
+    <h2>1. PDFをアップロード</h2>
+    <p class="hint">
+      レインズ等からダウンロードした図面PDFをドラッグ&ドロップ、または選択してください。
+      複数ファイル・複数ページの一括PDF（他社複数物件がまとまったもの）もそのまま処理できます。
+    </p>
+
+    <form id="upload-form">
+      <div id="dropzone" class="dropzone">
+        <div class="dropzone-icon">📄</div>
+        <div class="dropzone-text">
+          ここにPDFをドロップ<br>
+          <span class="dropzone-sub">またはクリックしてファイルを選択</span>
+        </div>
+        <input type="file" id="file-input" name="pdf_files" accept="application/pdf" multiple hidden>
+      </div>
+
+      <ul id="file-list" class="file-list"></ul>
+
+      <button type="submit" id="submit-btn" class="btn btn-primary" disabled>
+        帯替えを実行する
+      </button>
+    </form>
+
+    <div id="progress" class="progress hidden">
+      <div class="spinner"></div>
+      <span>処理中です。ページ数が多い場合は数十秒かかることがあります…</span>
+    </div>
+
+    <div id="error-box" class="error-box hidden"></div>
+  </section>
+
+  <section id="results" class="panel results-panel hidden">
+    <h2>2. 結果を確認してダウンロード</h2>
+    <p class="hint">
+      各ページの右上に自動判定の結果を表示しています。
+      <span class="badge badge-warn">念のため確認推奨</span> と
+      <span class="badge badge-danger">要確認</span> のページは、
+      必ずサムネイルを見比べて崩れがないかご確認ください。
+    </p>
+    <div id="results-content"></div>
+  </section>
+
+</main>
+
+<footer class="footer">
+  <p>社内ツール（帯替え自動化） / 処理結果はサーバーに保存されません（一定時間で自動破棄）</p>
+</footer>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('file-input');
+const fileListEl = document.getElementById('file-list');
+const submitBtn = document.getElementById('submit-btn');
+const form = document.getElementById('upload-form');
+const progressEl = document.getElementById('progress');
+const errorBox = document.getElementById('error-box');
+const resultsSection = document.getElementById('results');
+const resultsContent = document.getElementById('results-content');
+
+let selectedFiles = [];
+
+dropzone.addEventListener('click', () => fileInput.click());
+
+dropzone.addEventListener('dragover', (e) => {
+  e.preventDefault();
+  dropzone.classList.add('dragover');
+});
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+dropzone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropzone.classList.remove('dragover');
+  addFiles(e.dataTransfer.files);
+});
+
+fileInput.addEventListener('change', () => {
+  addFiles(fileInput.files);
+});
+
+function addFiles(fileListObj) {
+  for (const f of fileListObj) {
+    if (f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf')) {
+      selectedFiles.push(f);
+    }
+  }
+  renderFileList();
+}
+
+function renderFileList() {
+  fileListEl.innerHTML = '';
+  selectedFiles.forEach((f, idx) => {
+    const li = document.createElement('li');
+    li.innerHTML = `<span>${f.name}</span><button type="button" data-idx="${idx}" class="remove-btn">✕</button>`;
+    fileListEl.appendChild(li);
+  });
+  submitBtn.disabled = selectedFiles.length === 0;
+
+  fileListEl.querySelectorAll('.remove-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const idx = parseInt(btn.dataset.idx, 10);
+      selectedFiles.splice(idx, 1);
+      renderFileList();
+    });
+  });
+}
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (selectedFiles.length === 0) return;
+
+  errorBox.classList.add('hidden');
+  resultsSection.classList.add('hidden');
+  progressEl.classList.remove('hidden');
+  submitBtn.disabled = true;
+
+  const fd = new FormData();
+  selectedFiles.forEach(f => fd.append('pdf_files', f));
+
+  try {
+    const res = await fetch('/process_api', { method: 'POST', body: fd });
+    const data = await res.json();
+    progressEl.classList.add('hidden');
+    submitBtn.disabled = false;
+
+    if (!res.ok) {
+      showError(data.error || '処理に失敗しました。');
+      return;
+    }
+    renderResults(data);
+  } catch (err) {
+    progressEl.classList.add('hidden');
+    submitBtn.disabled = false;
+    showError('通信エラーが発生しました: ' + err);
+  }
+});
+
+function showError(msg) {
+  errorBox.textContent = msg;
+  errorBox.classList.remove('hidden');
+}
+
+function renderResults(data) {
+  resultsContent.innerHTML = '';
+  resultsSection.classList.remove('hidden');
+
+  data.files.forEach(fileResult => {
+    const fileBlock = document.createElement('div');
+    fileBlock.className = 'file-block';
+
+    if (fileResult.error) {
+      fileBlock.innerHTML = `
+        <div class="file-header">
+          <h3>${fileResult.filename}</h3>
+          <span class="badge badge-danger">エラー</span>
+        </div>
+        <p class="error-text">${fileResult.error}</p>
+      `;
+      resultsContent.appendChild(fileBlock);
+      return;
+    }
+
+    const jobId = data.job_id;
+    const fileKey = fileResult.file_key;
+
+    const header = document.createElement('div');
+    header.className = 'file-header';
+    header.innerHTML = `
+      <h3>${fileResult.filename}<span class="page-count">（全${fileResult.n_pages}ページ）</span></h3>
+      <div class="file-actions">
+        <a class="btn btn-secondary" href="/download/${jobId}/${fileKey}/combined">
+          全ページ結合PDFをダウンロード
+        </a>
+        <a class="btn btn-secondary" href="/download/${jobId}/${fileKey}/zip">
+          ページ別にZIPでダウンロード
+        </a>
+      </div>
+    `;
+    fileBlock.appendChild(header);
+
+    const grid = document.createElement('div');
+    grid.className = 'page-grid';
+
+    fileResult.pages.forEach(p => {
+      const card = document.createElement('div');
+      card.className = 'page-card';
+      card.innerHTML = `
+        <div class="page-card-top">
+          <span class="page-num">p.${p.page_index + 1}</span>
+          <span class="badge badge-${p.status_class}">${p.status_label}</span>
+        </div>
+        <div class="compare">
+          <div class="compare-col">
+            <div class="compare-label">処理前</div>
+            <img src="data:image/png;base64,${p.before_thumb_b64}" alt="処理前">
+          </div>
+          <div class="compare-col">
+            <div class="compare-label">処理後</div>
+            <img src="data:image/png;base64,${p.thumb_b64}" alt="処理後">
+          </div>
+        </div>
+        <a class="btn btn-small" href="/download/${jobId}/${fileKey}/page/${p.page_index}">
+          このページだけDL
+        </a>
+      `;
+      grid.appendChild(card);
+    });
+
+    fileBlock.appendChild(grid);
+    resultsContent.appendChild(fileBlock);
+  });
+
+  resultsSection.scrollIntoView({ behavior: 'smooth' });
+}
+</script>
+
+</body>
+</html>
