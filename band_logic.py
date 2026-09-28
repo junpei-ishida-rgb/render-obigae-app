@@ -121,18 +121,25 @@ def find_footer_top_candidates(page: fitz.Page):
     candidates = []  # (y0, confidence)
 
     # ① 罫線で囲まれた幅広ボックス
+    #    （物件の写真ギャラリー内の枠なども条件に合致してしまうことがあるため、
+    #     「箱の下端がページ最下部に近い」＝本当に最後尾の帯であることも
+    #     あわせて確認する）
     for d in page.get_drawings():
         r = d["rect"]
-        if r.width > rect_w * 0.45 and 15 < r.height < rect_h * 0.35 and r.y0 > search_top_shape:
+        if (r.width > rect_w * 0.45 and 15 < r.height < rect_h * 0.35
+                and r.y0 > search_top_shape and r.y1 > rect_h * 0.85):
             candidates.append((r.y0, "high"))
 
     # ② 会社ロゴ等が画像として埋め込まれているケース
+    #    （物件写真がたまたま横幅の条件を満たすことがあるため、同様に
+    #     画像の下端がページ最下部に近いことも確認する）
     for info in page.get_image_info(xrefs=True):
         bbox = fitz.Rect(info["bbox"])
         if (bbox.width > rect_w * 0.15
                 and 10 < bbox.height < rect_h * 0.35
                 and bbox.y0 > search_top_shape
-                and bbox.x0 < rect_w * 0.65):
+                and bbox.x0 < rect_w * 0.65
+                and bbox.y1 > rect_h * 0.85):
             candidates.append((bbox.y0, "high"))
 
     # ③ アンカー文字列（TEL/FAX/株式会社/取引態様/仲介手数料 等）
@@ -161,8 +168,26 @@ def replace_band_vector(doc: fitz.Document, page: fitz.Page, band_doc, band_clip
     # 一番上の候補がどの検出方法由来かで信頼度を決める
     confidence = "high" if any(y == min_y0 and c == "high" for y, c in candidates) else "medium"
 
-    pad = 4
-    box = fitz.Rect(0, max(0, min_y0 - pad), rect_w, rect_h)
+    pad = 1
+    boundary = max(0, min_y0 - pad)
+
+    # デザインによっては、物件情報側の最後の1行が帯の直前とほぼ隙間なく
+    # 配置されており、文字のバウンディングボックスが境界線をわずかに
+    # またいでしまうことがある。その場合に文字を半分だけ消してしまわない
+    # よう、境界と重なっているテキスト行があれば、その行の下端まで
+    # 境界を下げる（＝帯側が数ptだけ小さくなるだけなので実害はない）
+    blocks = page.get_text("blocks")
+    for _ in range(3):
+        moved = False
+        for block in blocks:
+            bx0, by0, bx1, by1 = block[:4]
+            if by0 < boundary < by1:
+                boundary = min(rect_h, by1 + 1)
+                moved = True
+        if not moved:
+            break
+
+    box = fitz.Rect(0, boundary, rect_w, rect_h)
 
     page.add_redact_annot(box, fill=(1, 1, 1))
     page.apply_redactions()
@@ -178,13 +203,21 @@ def replace_band_vector(doc: fitz.Document, page: fitz.Page, band_doc, band_clip
 # ラスターPDF（画像ページ）: 帯境界の検出
 # ---------------------------------------------------------------------------
 
-def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_frac=0.97):
+def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_frac=0.97,
+                       cluster_gap_pt=90, dpi=200):
     """画像を下から上にスキャンし、帯の上端となる横罫線を検出する。
     以下3種類の線に対応する:
       - 実線（黒・グレー系の暗い罫線）
       - 破線・点線
       - 色付きの帯（オレンジ色の区切りバー等、暗くはないが単色でページ幅
         いっぱいに広がっている線）
+
+    「大枠＋その中に業者情報の内枠」のように、帯の範囲内に複数の横線が
+    存在するケースがあるため、最初に見つかった線（＝一番下の線）で
+    即決めるのではなく、検索範囲内の該当行をすべて集めたうえで、
+    ページ下端に近い方から見て連続している「かたまり」を1つの帯とみなし、
+    そのかたまりの中で一番上の線を帯の開始位置として採用する
+    （＝大枠の外側の線を正しく拾えるようにするため）。
     見つかった場合 (y, confidence) を返す。
     ページ最下端ギリギリ（外枠の罫線など）を誤検出しないよう、
     search_to_frac で下端付近を検索対象から除外する。"""
@@ -194,12 +227,15 @@ def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_fra
     start_y = int(h * search_from_frac)
     end_y = int(h * search_to_frac)  # これより下（ページ最下端寄り）は見ない
 
-    for y in range(end_y, start_y, -1):
+    hits = []  # (y, confidence)
+
+    for y in range(start_y, end_y):
         row_gray = gray[y]
 
         # ①実線（行の80%以上が暗い）
         if (row_gray < 150).mean() > 0.8:
-            return y, "high"
+            hits.append((y, "high"))
+            continue
 
         # ②単色の帯（色は問わない。行の85%以上が同じ色で、かつ白に近すぎない）
         row_rgb = rgb[y]
@@ -213,7 +249,8 @@ def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_fra
             r, g, b = key // 10000, (key // 100) % 100, key % 100
             brightness = (r + g + b) / 3 * 24
             if brightness < 235:
-                return y, "high"
+                hits.append((y, "high"))
+                continue
 
         # ③破線・点線（暗いピクセルは少ないが、均等な間隔で幅広く分布する
         #   小さな線分の繰り返しになっている）
@@ -223,8 +260,6 @@ def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_fra
             dark_idx = np.where(dark)[0]
             spread = (dark_idx.max() - dark_idx.min()) / w if len(dark_idx) else 0
             if spread > 0.85:
-                # 連続した暗い区間（セグメント）に分割し、本文テキストの
-                # 行（大きさや間隔がバラバラ）と区別する
                 gaps = np.where(np.diff(dark_idx) > 1)[0]
                 segments = np.split(dark_idx, gaps + 1)
                 seg_lengths = [len(s) for s in segments]
@@ -232,9 +267,40 @@ def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_fra
                     max_len = max(seg_lengths)
                     min_len = min(seg_lengths)
                     if max_len <= w * 0.02 and max_len / max(min_len, 1) < 4:
-                        return y, "medium"
+                        hits.append((y, "medium"))
 
-    return None, None
+    if not hits:
+        return None, None
+
+    # 連続する行をまとめて1本の線とみなす
+    lines = []  # (y_top, confidence)
+    cur_ys = [hits[0][0]]
+    cur_conf = hits[0][1]
+    for y, conf in hits[1:]:
+        if y - cur_ys[-1] <= 3:
+            cur_ys.append(y)
+            if conf == "high":
+                cur_conf = "high"
+        else:
+            lines.append((cur_ys[0], cur_conf))
+            cur_ys = [y]
+            cur_conf = conf
+    lines.append((cur_ys[0], cur_conf))
+
+    # 線同士の間隔が cluster_gap_pt（pt換算）以内なら同じ「帯のかたまり」と
+    # みなし、ページ下端に一番近いかたまりを採用。そのかたまりの中で
+    # 一番上の線を帯の開始位置とする
+    gap_px = cluster_gap_pt * dpi / 72
+    cluster = [lines[-1]]
+    for y, conf in reversed(lines[:-1]):
+        if cluster[-1][0] - y <= gap_px:
+            cluster.append((y, conf))
+        else:
+            break
+
+    top_y, _ = min(cluster, key=lambda t: t[0])
+    best_conf = "high" if any(c == "high" for _, c in cluster) else "medium"
+    return top_y, best_conf
 
 
 def replace_band_raster(page: fitz.Page, band_doc, band_clip, dpi=200):
@@ -243,7 +309,7 @@ def replace_band_raster(page: fitz.Page, band_doc, band_clip, dpi=200):
     pix = page.get_pixmap(dpi=dpi)
     pil_img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
 
-    band_top_px, confidence = find_band_top_row(pil_img)
+    band_top_px, confidence = find_band_top_row(pil_img, dpi=dpi)
     if band_top_px is None:
         # 検出に失敗した場合は既定値（88%位置）を使い、低信頼度として扱う
         band_top_px = int(pil_img.height * 0.88)
