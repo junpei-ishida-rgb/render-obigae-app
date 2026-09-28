@@ -40,10 +40,15 @@ BAND_CONFIG = {
     },
 }
 
-# ベクターPDFで「会社情報ボックス」を判定するための手がかり文字列
+# ベクターPDFで「会社情報・取引条件ボックス」を判定するための手がかり文字列
+# （お客様に見せてはいけない業者間情報＝仲介手数料・取引態様なども含めて
+#   検出できるよう、幅広く拾う）
 ANCHOR_KEYWORDS = [
     "TEL", "FAX", "株式会社", "㈱", "有限会社",
-    "国土交通大臣", "東京都知事", "immo", "免許",
+    "国土交通大臣", "東京都知事", "免許",
+    "取引態様", "取引形態", "仲介手数料", "業務委託手数料",
+    "客付", "元付", "貸主", "借主", "AD：", "AD:", "広告料",
+    "仲介業者様", "社宅利用", "鍵：現地対応", "ITANDI",
 ]
 
 # 十分なテキストがないページは「ラスター扱い」にする文字数しきい値
@@ -98,74 +103,64 @@ def fit_rect(target: fitz.Rect, src_w: float, src_h: float, align="bottom-left")
 # ベクターPDF: 帯（会社情報ボックス）の検出
 # ---------------------------------------------------------------------------
 
-def find_footer_box_by_border(page: fitz.Page):
-    """下部にある「幅広の罫線ボックス」を帯の候補として探す。
-    見つかれば (Rect, confidence='high') を返す。"""
+def find_footer_top_candidates(page: fitz.Page):
+    """帯・取引条件欄を構成しうる要素（画像／罫線ボックス／キーワード文字列）
+    をすべて集め、それぞれの上端y座標と信頼度ラベルを返す。
+    ここで集めた候補のうち一番上（最小y0）を「帯の開始位置」として採用し、
+    そこから下をページ全幅で白塗りする（項目ごとに個別の矩形は使わない）。
+    """
     rect_h = page.rect.height
     rect_w = page.rect.width
-    candidates = []
+    # 罫線ボックス／画像は形状の条件が厳しいので広めの範囲で探して良いが、
+    # キーワード検索は本文中に同じ語（取引態様・貸主等）が別の意味で出て
+    # くることがあるため、より下部（ページ最下部付近）に絞って誤検出を防ぐ
+    search_top_shape = rect_h * 0.55
+    search_top_keyword = rect_h * 0.80
+    candidates = []  # (y0, confidence)
+
+    # ① 罫線で囲まれた幅広ボックス
     for d in page.get_drawings():
         r = d["rect"]
-        if r.width > rect_w * 0.45 and 15 < r.height < rect_h * 0.35 and r.y0 > rect_h * 0.55:
-            candidates.append(r)
-    if not candidates:
-        return None, None
-    # 一番下にある／一番大きいものを採用
-    best = max(candidates, key=lambda r: r.width * r.height)
-    return fitz.Rect(best), "high"
+        if r.width > rect_w * 0.45 and 15 < r.height < rect_h * 0.35 and r.y0 > search_top_shape:
+            candidates.append((r.y0, "high"))
 
-
-def find_footer_box_by_image(page: fitz.Page):
-    """会社ロゴ・住所・TEL等が1枚の画像として埋め込まれているタイプ
-    （例: 会社名で検索してもヒットしないテンプレート）向け。
-    下部にある幅広の画像を帯の候補として探す。"""
-    rect_h = page.rect.height
-    rect_w = page.rect.width
-    candidates = []
+    # ② 会社ロゴ等が画像として埋め込まれているケース
     for info in page.get_image_info(xrefs=True):
         bbox = fitz.Rect(info["bbox"])
         if (bbox.width > rect_w * 0.15
                 and 10 < bbox.height < rect_h * 0.35
-                and bbox.y0 > rect_h * 0.55
+                and bbox.y0 > search_top_shape
                 and bbox.x0 < rect_w * 0.65):
-            candidates.append(bbox)
-    if not candidates:
-        return None, None
-    best = max(candidates, key=lambda b: b.width * b.height)
-    return best, "high"
+            candidates.append((bbox.y0, "high"))
 
-
-def find_footer_box_by_anchor(page: fitz.Page):
-    """罫線ボックスが見つからない場合のフォールバック：
-    TEL/FAX/株式会社などのアンカー文字列の位置から帯の範囲を推定する。"""
-    rect_h = page.rect.height
-    rect_w = page.rect.width
-    hits = []
+    # ③ アンカー文字列（TEL/FAX/株式会社/取引態様/仲介手数料 等）
     for kw in ANCHOR_KEYWORDS:
         for r in page.search_for(kw):
-            if r.y0 > rect_h * 0.55:
-                hits.append(r)
-    if not hits:
-        return None, None
+            if r.y0 > search_top_keyword:
+                candidates.append((r.y0, "medium"))
 
-    min_y0 = min(r.y0 for r in hits)
-    # 少し上に余白を持たせる
-    pad = 6
-    box = fitz.Rect(0, max(0, min_y0 - pad), rect_w, rect_h)
-    return box, "low"
+    return candidates
 
 
 def replace_band_vector(doc: fitz.Document, page: fitz.Page, band_doc, band_clip):
-    # 優先順位: ①会社情報が画像として埋め込まれているケース
-    #          ②罫線で囲まれた帯ボックスが見つかるケース
-    #          ③アンカー文字列（TEL/FAX等）からの推定（フォールバック）
-    box, confidence = find_footer_box_by_image(page)
-    if box is None:
-        box, confidence = find_footer_box_by_border(page)
-    if box is None:
-        box, confidence = find_footer_box_by_anchor(page)
-    if box is None:
+    """帯・取引条件欄の中で一番上にある要素を探し、そこから下をページ全幅で
+    白塗りしたうえで、自社の帯を全幅で重ね込む。
+    （物件の設備欄などがその下端より下にはみ出ていない前提。実務上、
+    帯・取引条件欄はページの一番下にまとまっているため、この前提で問題ない）
+    """
+    rect_h = page.rect.height
+    rect_w = page.rect.width
+
+    candidates = find_footer_top_candidates(page)
+    if not candidates:
         return "failed", None
+
+    min_y0 = min(y for y, _c in candidates)
+    # 一番上の候補がどの検出方法由来かで信頼度を決める
+    confidence = "high" if any(y == min_y0 and c == "high" for y, c in candidates) else "medium"
+
+    pad = 4
+    box = fitz.Rect(0, max(0, min_y0 - pad), rect_w, rect_h)
 
     page.add_redact_annot(box, fill=(1, 1, 1))
     page.apply_redactions()
@@ -182,32 +177,60 @@ def replace_band_vector(doc: fitz.Document, page: fitz.Page, band_doc, band_clip
 # ---------------------------------------------------------------------------
 
 def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_frac=0.97):
-    """画像を下から上にスキャンし、帯の上端となる横罫線（実線・破線とも）
-    を検出する。見つかった場合 (y, confidence) を返す。
+    """画像を下から上にスキャンし、帯の上端となる横罫線を検出する。
+    以下3種類の線に対応する:
+      - 実線（黒・グレー系の暗い罫線）
+      - 破線・点線
+      - 色付きの帯（オレンジ色の区切りバー等、暗くはないが単色でページ幅
+        いっぱいに広がっている線）
+    見つかった場合 (y, confidence) を返す。
     ページ最下端ギリギリ（外枠の罫線など）を誤検出しないよう、
     search_to_frac で下端付近を検索対象から除外する。"""
-    arr = np.array(pil_img.convert("L"))
-    h, w = arr.shape
+    gray = np.array(pil_img.convert("L"))
+    rgb = np.array(pil_img.convert("RGB"))
+    h, w = gray.shape
     start_y = int(h * search_from_frac)
     end_y = int(h * search_to_frac)  # これより下（ページ最下端寄り）は見ない
 
-    # 1st pass: 実線（行の80%以上が暗い）
     for y in range(end_y, start_y, -1):
-        row = arr[y]
-        if (row < 150).mean() > 0.8:
+        row_gray = gray[y]
+
+        # ①実線（行の80%以上が暗い）
+        if (row_gray < 150).mean() > 0.8:
             return y, "high"
 
-    # 2nd pass: 破線・点線（暗いピクセルは少ないが、周期的に幅広く分布）
-    for y in range(end_y, start_y, -1):
-        row = arr[y]
-        dark = row < 150
+        # ②単色の帯（色は問わない。行の85%以上が同じ色で、かつ白に近すぎない）
+        row_rgb = rgb[y]
+        bucketed = (row_rgb // 24).astype(np.int32)
+        keys = bucketed[:, 0] * 10000 + bucketed[:, 1] * 100 + bucketed[:, 2]
+        vals, counts = np.unique(keys, return_counts=True)
+        top_idx = counts.argmax()
+        frac = counts[top_idx] / len(row_rgb)
+        if frac > 0.85:
+            key = vals[top_idx]
+            r, g, b = key // 10000, (key // 100) % 100, key % 100
+            brightness = (r + g + b) / 3 * 24
+            if brightness < 235:
+                return y, "high"
+
+        # ③破線・点線（暗いピクセルは少ないが、均等な間隔で幅広く分布する
+        #   小さな線分の繰り返しになっている）
+        dark = row_gray < 150
         dark_frac = dark.mean()
         if 0.15 < dark_frac < 0.8:
-            # 暗い部分が画像の左端から右端まで広く分布しているかチェック
             dark_idx = np.where(dark)[0]
             spread = (dark_idx.max() - dark_idx.min()) / w if len(dark_idx) else 0
-            if spread > 0.7:
-                return y, "medium"
+            if spread > 0.85:
+                # 連続した暗い区間（セグメント）に分割し、本文テキストの
+                # 行（大きさや間隔がバラバラ）と区別する
+                gaps = np.where(np.diff(dark_idx) > 1)[0]
+                segments = np.split(dark_idx, gaps + 1)
+                seg_lengths = [len(s) for s in segments]
+                if len(segments) >= 12:
+                    max_len = max(seg_lengths)
+                    min_len = min(seg_lengths)
+                    if max_len <= w * 0.02 and max_len / max(min_len, 1) < 4:
+                        return y, "medium"
 
     return None, None
 
