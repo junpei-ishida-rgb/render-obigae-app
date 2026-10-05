@@ -118,6 +118,10 @@ def find_footer_top_candidates(page: fitz.Page):
     # くることがあるため、より下部（ページ最下部付近）に絞って誤検出を防ぐ
     search_top_shape = rect_h * 0.55
     search_top_keyword = rect_h * 0.80
+    # ④で使う、会社ロゴが「文字をアウトライン化したベクター図形」として
+    # 描かれているケース向けの検索範囲。帯以外の目立つ色付きボックス
+    # （価格タグ等）を誤って拾わないよう、かなり下部に絞る
+    search_top_vector_logo = rect_h * 0.80
     candidates = []  # (y0, confidence)
 
     # ① 罫線で囲まれた幅広ボックス
@@ -147,6 +151,19 @@ def find_footer_top_candidates(page: fitz.Page):
         for r in page.search_for(kw):
             if r.y0 > search_top_keyword:
                 candidates.append((r.y0, "medium"))
+
+    # ④ 会社ロゴが画像でも検索可能なテキストでもなく、文字の形そのものが
+    #    ベクター図形（パス）として描かれているケース。
+    #    ①の罫線ボックスより幅の条件を緩めて拾うが、物件情報側の目立つ
+    #    色付きボックス（価格タグ等）を誤検出しないよう、検索範囲を
+    #    ページ下部のごく一部（search_top_vector_logo より下）に限定する
+    for d in page.get_drawings():
+        r = d["rect"]
+        if (r.width > rect_w * 0.10 and 10 < r.height < rect_h * 0.35
+                and r.y0 > search_top_vector_logo
+                and r.x0 < rect_w * 0.55
+                and r.y1 > rect_h * 0.85):
+            candidates.append((r.y0, "medium"))
 
     return candidates
 
