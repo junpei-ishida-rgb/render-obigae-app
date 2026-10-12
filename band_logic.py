@@ -244,12 +244,26 @@ def find_band_top_row(pil_img: Image.Image, search_from_frac=0.55, search_to_fra
     start_y = int(h * search_from_frac)
     end_y = int(h * search_to_frac)  # これより下（ページ最下端寄り）は見ない
 
+    # 角丸の罫線は、角の部分がカーブして横一直線から外れるため、行単体では
+    # 「暗いピクセルの割合」が80%に届かないことがある。また線が細い/薄い
+    # 場合、アンチエイリアスで暗さが上下数行に分散してしまうこともある。
+    # そこで、前後数行をまとめて「そのどこかが暗ければそのcolumnは暗い」
+    # とみなす縦方向のウィンドウ判定を導入し、角丸・薄い線の両方を
+    # 拾えるようにする
+    window = 3
+    dark_mask_all = gray < 200
     hits = []  # (y, confidence)
 
     for y in range(start_y, end_y):
         row_gray = gray[y]
 
-        # ①実線（行の80%以上が暗い）
+        band = dark_mask_all[max(0, y - window):y + window + 1]
+        windowed_frac = band.any(axis=0).mean()
+        if windowed_frac > 0.70:
+            hits.append((y, "high"))
+            continue
+
+        # ①実線（行の80%以上が暗い。角丸でない通常の罫線向け）
         if (row_gray < 150).mean() > 0.8:
             hits.append((y, "high"))
             continue
